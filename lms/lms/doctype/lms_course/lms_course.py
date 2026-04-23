@@ -288,7 +288,7 @@ def export_course(course_name: str):
 
     course = frappe.get_doc("LMS Course", course_name)
 
-    # 1. Construir diccionario completo basado en los campos del JSON
+    # 1. Construir diccionario completo
     course_data = {
         "title": course.title,
         "short_introduction": course.short_introduction,
@@ -305,8 +305,8 @@ def export_course(course_name: str):
         "card_gradient": course.card_gradient,
         "instructors": [],
         "chapters": [],
-        "assignments": [], # NUEVO: Inicializar lista de asignaciones
-        "quizzes": [],     # NUEVO: Inicializar lista de quizzes
+        "assignments": [],
+        "quizzes": [],
     }
 
     # Exportar Instructores
@@ -315,7 +315,7 @@ def export_course(course_name: str):
             "instructor": inst.instructor
         })
 
-    # Exportar Estructura (Capítulos y Lecciones)
+    # Exportar Estructura
     for chapter_ref in course.chapters:
         chapter_doc_name = chapter_ref.chapter if hasattr(chapter_ref, "chapter") else chapter_ref.name
         chapter_doc = frappe.get_doc("Course Chapter", chapter_doc_name)
@@ -341,7 +341,7 @@ def export_course(course_name: str):
 
         course_data["chapters"].append(chapter_data)
 
-    # NUEVO: Exportar Asignaciones
+    # Exportar Asignaciones
     assignments = frappe.get_all("LMS Assignment", {"course": course.name}, ["name"])
     for a in assignments:
         a_doc = frappe.get_doc("LMS Assignment", a.name)
@@ -354,12 +354,13 @@ def export_course(course_name: str):
             "grade_assignment": a_doc.grade_assignment
         })
 
-    # NUEVO: Exportar Quizzes (y sus Preguntas)
+    # Exportar Quizzes
     quizzes = frappe.get_all("LMS Quiz", {"course": course.name}, ["name"])
     for q in quizzes:
         q_doc = frappe.get_doc("LMS Quiz", q.name)
         
         q_data = {
+            "id": q_doc.name, # <--- IMPORTANTE: Guardar ID original
             "title": q_doc.title,
             "max_attempts": q_doc.max_attempts,
             "show_answers": q_doc.show_answers,
@@ -376,7 +377,6 @@ def export_course(course_name: str):
         for row in q_doc.questions:
             question_doc = frappe.get_doc("LMS Question", row.question)
             
-            # Exportamos toda la pregunta completa para portabilidad
             question_data = {
                 "question": question_doc.question,
                 "type": question_doc.type,
@@ -397,7 +397,7 @@ def export_course(course_name: str):
                 "possibility_2": question_doc.possibility_2,
                 "possibility_3": question_doc.possibility_3,
                 "possibility_4": question_doc.possibility_4,
-                "marks": row.marks # Marks está en la tabla hija (Quiz Question)
+                "marks": row.marks
             }
             q_data["questions"].append(question_data)
         
@@ -441,10 +441,9 @@ def export_course(course_name: str):
 def import_course(file_url: str):
     """Importa un curso desde un archivo ZIP."""
 
-    # 1. Localizar el archivo en el File Manager
     file_docs = frappe.get_all("File", filters={"file_url": file_url}, fields=["name"])
     if not file_docs:
-        frappe.throw(_("No se encontró el archivo en el sistema. Asegúrate de haberlo subido correctamente."))
+        frappe.throw(_("No se encontró el archivo en el sistema."))
 
     file_doc = frappe.get_doc("File", file_docs[0].name)
     file_path = file_doc.get_full_path()
@@ -455,19 +454,17 @@ def import_course(file_url: str):
     temp_dir = tempfile.mkdtemp()
 
     try:
-        # 2. Extraer el ZIP de forma segura
         with zipfile.ZipFile(file_path, "r") as zip_ref:
             safe_extract(zip_ref, temp_dir)
 
-        # 3. Leer JSON
         json_path = os.path.join(temp_dir, "course.json")
         if not os.path.exists(json_path):
-            frappe.throw(_("El archivo ZIP no contiene course.json. Verifica que sea un export válido."))
+            frappe.throw(_("El archivo ZIP no contiene course.json."))
 
         with open(json_path, "r", encoding="utf-8") as f:
             course_data = json.load(f)
 
-        # 4. Crear el documento LMS Course
+        # Crear el documento LMS Course
         course = frappe.new_doc("LMS Course")
         course.title = get_unique_course_title(course_data.get("title"))
         course.short_introduction = course_data.get("short_introduction")
@@ -480,12 +477,10 @@ def import_course(file_url: str):
         course.enable_certification = course_data.get("enable_certification")
         course.card_gradient = course_data.get("card_gradient")
         
-        # Categoria (validar existencia)
         raw_category = course_data.get("category")
         if raw_category and frappe.db.exists("LMS Category", raw_category):
             course.category = raw_category
 
-        # 5. Importar Instructores
         instructors_imported = False
         for inst in course_data.get("instructors", []):
             email = inst.get("instructor")
@@ -496,11 +491,9 @@ def import_course(file_url: str):
         if not instructors_imported:
             course.append("instructors", {"instructor": frappe.session.user})
 
-        # Insertar Curso para obtener ID
         course.insert(ignore_permissions=True)
         course_name = course.name
 
-        # 6. Adjuntar imagen
         if course_data.get("image"):
             image_filename = os.path.basename(course_data["image"])
             asset_path = os.path.join(temp_dir, "assets", image_filename)
@@ -518,58 +511,17 @@ def import_course(file_url: str):
                 }).insert(ignore_permissions=True)
                 frappe.db.set_value("LMS Course", course_name, "image", saved_file.file_url)
 
-        # 7. Crear capítulos y lecciones
-        chapter_names = []
-        lesson_map = {} # NUEVO: Mapa para vincular quizzes a lecciones
+        # -----------------------------------------------------------
+        # PASO 1: PRE-CREAR QUIZZES Y MAPEAR IDs
+        # Esto es necesario porque las lecciones validan que el Quiz exista al guardarse.
+        # -----------------------------------------------------------
+        quiz_id_map = {} # Mapa: old_id -> new_name
+        lesson_title_quiz_map = {} # Mapa: lesson_title -> new_quiz_name
 
-        for chapter_data in course_data.get("chapters", []):
-            chapter = frappe.new_doc("Course Chapter")
-            chapter.course = course_name
-            chapter.title = chapter_data.get("title") or _("Capítulo sin título")
-            chapter.insert(ignore_permissions=True)
-            chapter_name = chapter.name
-
-            for lesson_data in chapter_data.get("lessons", []):
-                lesson = frappe.new_doc("Course Lesson")
-                lesson.course = course_name
-                lesson.chapter = chapter_name
-                lesson.title = lesson_data.get("title") or _("Lección sin título")
-                lesson.body = lesson_data.get("body")
-                lesson.content = lesson_data.get("content")
-                lesson.youtube = lesson_data.get("youtube")
-                lesson.insert(ignore_permissions=True)
-                
-                # NUEVO: Guardar relación Título -> ID
-                lesson_map[lesson.title] = lesson.name
-
-                chapter = frappe.get_doc("Course Chapter", chapter_name)
-                chapter.append("lessons", {"lesson": lesson.name})
-                chapter.save(ignore_permissions=True)
-
-            chapter_names.append(chapter_name)
-
-        # 8. Vincular capítulos al curso
-        course = frappe.get_doc("LMS Course", course_name)
-        for ch_name in chapter_names:
-            course.append("chapters", {"chapter": ch_name})
-        course.save(ignore_permissions=True)
-
-        # NUEVO: 9. Crear Asignaciones
-        for a_data in course_data.get("assignments", []):
-            assignment = frappe.new_doc("LMS Assignment")
-            assignment.course = course_name
-            assignment.title = a_data.get("title")
-            assignment.type = a_data.get("type")
-            assignment.question = a_data.get("question")
-            assignment.answer = a_data.get("answer")
-            assignment.show_answer = a_data.get("show_answer")
-            assignment.grade_assignment = a_data.get("grade_assignment")
-            assignment.insert(ignore_permissions=True)
-
-        # NUEVO: 10. Crear Quizzes
         for q_data in course_data.get("quizzes", []):
             quiz = frappe.new_doc("LMS Quiz")
             quiz.title = get_unique_quiz_title(q_data.get("title"))
+            quiz.course = course_name
             quiz.max_attempts = q_data.get("max_attempts")
             quiz.show_answers = q_data.get("show_answers")
             quiz.passing_percentage = q_data.get("passing_percentage")
@@ -579,16 +531,8 @@ def import_course(file_url: str):
             quiz.enable_negative_marking = q_data.get("enable_negative_marking")
             quiz.marks_to_cut = q_data.get("marks_to_cut")
             
-            # Vincular lección si existe
-            lesson_title = q_data.get("lesson_title")
-            if lesson_title and lesson_title in lesson_map:
-                quiz.lesson = lesson_map[lesson_title]
-            
-            quiz.course = course_name
-            
-            # Crear Preguntas y añadir al Quiz
+            # Crear preguntas
             for qst_data in q_data.get("questions", []):
-                # A. Crear LMS Question
                 question = frappe.new_doc("LMS Question")
                 question.question = qst_data.get("question")
                 question.type = qst_data.get("type")
@@ -611,13 +555,92 @@ def import_course(file_url: str):
                 question.possibility_4 = qst_data.get("possibility_4")
                 question.insert(ignore_permissions=True)
                 
-                # B. Añadir referencia al Quiz
                 quiz.append("questions", {
                     "question": question.name,
                     "marks": qst_data.get("marks")
                 })
             
             quiz.insert(ignore_permissions=True)
+            
+            # Guardar mapeo
+            old_id = q_data.get("id")
+            if old_id:
+                quiz_id_map[old_id] = quiz.name
+            
+            lesson_title = q_data.get("lesson_title")
+            if lesson_title:
+                lesson_title_quiz_map[lesson_title] = quiz.name
+
+        # -----------------------------------------------------------
+        # PASO 2: CREAR CAPÍTULOS Y LECCIONES (ACTUALIZANDO IDs DE QUIZ)
+        # -----------------------------------------------------------
+        chapter_names = []
+        lesson_map = {}
+
+        for chapter_data in course_data.get("chapters", []):
+            chapter = frappe.new_doc("Course Chapter")
+            chapter.course = course_name
+            chapter.title = chapter_data.get("title") or _("Capítulo sin título")
+            chapter.insert(ignore_permissions=True)
+            chapter_name = chapter.name
+
+            for lesson_data in chapter_data.get("lessons", []):
+                lesson = frappe.new_doc("Course Lesson")
+                lesson.course = course_name
+                lesson.chapter = chapter_name
+                lesson.title = lesson_data.get("title") or _("Lección sin título")
+                lesson.body = lesson_data.get("body")
+                lesson.youtube = lesson_data.get("youtube")
+                
+                # ACTUALIZAR IDs DE QUIZ EN EL CONTENIDO
+                content_str = lesson_data.get("content")
+                if content_str:
+                    try:
+                        content_json = json.loads(content_str)
+                        if "blocks" in content_json:
+                            for block in content_json["blocks"]:
+                                if block.get("type") == "quiz" and block.get("data", {}).get("quiz"):
+                                    old_q_id = block["data"]["quiz"]
+                                    if old_q_id in quiz_id_map:
+                                        block["data"]["quiz"] = quiz_id_map[old_q_id]
+                        lesson.content = json.dumps(content_json)
+                    except:
+                        lesson.content = content_str
+
+                lesson.insert(ignore_permissions=True)
+                
+                lesson_map[lesson.title] = lesson.name
+
+                chapter = frappe.get_doc("Course Chapter", chapter_name)
+                chapter.append("lessons", {"lesson": lesson.name})
+                chapter.save(ignore_permissions=True)
+
+            chapter_names.append(chapter_name)
+
+        # Vincular capítulos al curso
+        course = frappe.get_doc("LMS Course", course_name)
+        for ch_name in chapter_names:
+            course.append("chapters", {"chapter": ch_name})
+        course.save(ignore_permissions=True)
+
+        # -----------------------------------------------------------
+        # PASO 3: CREAR ASIGNACIONES Y ACTUALIZAR LINKS FINALES
+        # -----------------------------------------------------------
+        for a_data in course_data.get("assignments", []):
+            assignment = frappe.new_doc("LMS Assignment")
+            assignment.course = course_name
+            assignment.title = a_data.get("title")
+            assignment.type = a_data.get("type")
+            assignment.question = a_data.get("question")
+            assignment.answer = a_data.get("answer")
+            assignment.show_answer = a_data.get("show_answer")
+            assignment.grade_assignment = a_data.get("grade_assignment")
+            assignment.insert(ignore_permissions=True)
+
+        # Actualizar campo 'lesson' en los Quizzes creados
+        for lesson_title, quiz_name in lesson_title_quiz_map.items():
+            if lesson_title in lesson_map:
+                frappe.db.set_value("LMS Quiz", quiz_name, "lesson", lesson_map[lesson_title])
 
         frappe.db.commit()
         return course_name
